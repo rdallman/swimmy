@@ -16,17 +16,22 @@ import (
 )
 
 type Config struct {
-	Host           string
-	Port           uint16
-	Listeners      []chan Event
-	Store          StableStore // persist quorum
-	Seeds          []*net.UDPAddr
-	GossipInterval time.Duration
-	FailInterval   time.Duration
-	Timeout        time.Duration
-	MaxBufferLen   int // max piggybacks to send on one request
-	K              int // number of people to ping-req on failed ack
-	Lambda         int // λ log n times to piggyback an event
+	// Necessary paremeters
+	Host  string // TODO get this dynamically
+	Port  uint16 // TODO pick a default
+	Seeds []*net.UDPAddr
+
+	// Optional custom parameters w/ sane defaults
+	GossipInterval time.Duration // default: 200ms
+	FailInterval   time.Duration // default: 1s
+	Timeout        time.Duration // default: 10ms
+	MaxBufferLen   int           // max piggybacks to send on one request. default: 6
+	K              int           // number of people to ping-req on failed ack. default: 1 TODO 2?
+	Lambda         int           // λ log n times to piggyback an event. default: 3
+
+	// Listen for events and make decisions yourself. Make sure
+	// to pull from this channel reasonably fast.
+	Listeners []chan Event
 }
 
 type Event struct {
@@ -65,7 +70,6 @@ func (e EventType) String() string {
 type Clique struct {
 	conn           *net.UDPConn
 	done           chan struct{}
-	store          StableStore
 	me             *net.UDPAddr
 	gossipInterval time.Duration
 	failInterval   time.Duration
@@ -125,7 +129,6 @@ func New(conf *Config) (*Clique, error) {
 		done:           make(chan struct{}),
 		mems:           make(map[string]*peer),
 		listeners:      conf.Listeners,
-		store:          conf.Store,
 		timeout:        conf.Timeout,
 		gossipInterval: conf.GossipInterval,
 		failInterval:   conf.FailInterval,
@@ -282,6 +285,8 @@ const (
 	ping reqT = iota
 	pingReq
 	ack
+	join
+	joinAck
 
 	piggySize = net.IPv4len + 2 + 1 // sizeof(uint16) + TODO gen bits
 )

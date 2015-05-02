@@ -7,7 +7,7 @@ package swimmy
 //	:::swimbers:::
 //
 // and store our last stable membership and quorum number.
-type StableStore interface {
-	Put(k, v []byte) error
-	Get(k []byte) ([]byte, error)
-}
+//type StableStore interface {
+//Put(k, v []byte) error
+//Get(k []byte) ([]byte, error)
+//}
