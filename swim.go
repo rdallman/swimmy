@@ -12,8 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	// TODO use normal log15
-	"github.com/iron-io/go/vendored/gopkg.in/inconshreveable/log15.v2"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type Config struct {
@@ -245,35 +244,35 @@ func (c *Clique) Seed(peers []*net.UDPAddr) {
 // we have gossipped them λ log n times, at which point they're removed.
 //
 // a node may add a new event to the chain to gossip when:
-//	Alive   -> Suspect:     no ack is received in gossip interval
-//	Suspect -> Confirm::    no ack is received in failure interval
-//	_       -> Alive:       receive from a node not in alive state
+// Alive   -> Suspect:     no ack is received in gossip interval
+// Suspect -> Confirm::    no ack is received in failure interval
+// _       -> Alive:       receive from a node not in alive state
 //
 // in addition to new events, an event that is seen piggy backed on any received
 // messages, will be checked against the current buffer for any disparities,
 // such that:
 //
-//	Alive   overrides { Suspect }
-//	Suspect overrides { Alive }
-//	Confirm overrides { Suspect, Alive }
+// Alive   overrides { Suspect }
+// Suspect overrides { Alive }
+// Confirm overrides { Suspect, Alive }
 //
 // any message that does not meet the above criteria but is not already
 // in the buffer, will be added to the buffer (it's index uncertain).
 //
 // we define the packet such that:
-//	[ 0			0 1 2 3 4 : 5 6					[ 7 8 9 10 : 11 12    | 13 ] ...  [ TODO tags ] ]
-//		type	dst: ip			port	piggyback:	ip			port		type
+//  [ 0     0 1 2 3 4 : 5 6  [ 7 8 9 10 : 11 12    | 13 ] ...  [ TODO tags ] ]
+//    type  dst: ip : port    piggyback: ip : port  type
 //
 // where src is the origination of the message, such that ping-req and it's succeeding
 // messages will have dst != from. A full example of a ping-req sequence below.
 //
 //  TODO reason about the below after sleeping
 //  A -> B Ping(To: B, From: A, Origin: A)
-//	A Timeout(B)
-//	A -> C PingReq(To: C, From: A, Origin: B)
-//	C -> B Ping(To: B, From: C, Origin: A)
-//	B -> C Ack(To: C, From: B, Origin: A)
-//	C -> A Ack(To: A, From: C, Origin: B)
+// A Timeout(B)
+// A -> C PingReq(To: C, From: A, Origin: B)
+// C -> B Ping(To: B, From: C, Origin: A)
+// B -> C Ack(To: C, From: B, Origin: A)
+// C -> A Ack(To: A, From: C, Origin: B)
 //
 // TODO generation bits, tags
 
@@ -321,9 +320,9 @@ func (p *pigs) Pop() interface{} { old := *p; pe := old[len(old)-1]; *p = old[:l
 // but this func only allows one of either. we could do more, but why?
 //
 // the goal of this is to synchronize reads and writes to:
-//		pals
-//		members
-//		piggyBuffer
+//   pals
+//   members
+//   piggyBuffer
 //
 // since each is potentially a writer and a reader of 1 or more
 // and since traffic should be low, we prefer less mutexes and
@@ -495,8 +494,8 @@ func parseIPPort(b []byte) *net.UDPAddr {
 }
 
 // TODO little funcs reed
-// [ 0		1 2 3 4 : 5 6		[ 1 2 3 4 : 5 6		7		8 9 10 11 ] ... ]
-//	type   to: host:port		host:port			event time
+// [ 0     1 2 3 4 : 5 6   [ 1 2 3 4 : 5 6   7    8 9 10 11 ] ... ]
+// type   to: host:port     host:port      event time
 func (c *Clique) send(out draft) {
 	buf := c.bufPool.Get().([]byte)
 	buf[0] = byte(out.What)
@@ -577,23 +576,23 @@ func (c *Clique) upsertPiggy(e peer) {
 
 	old := c.pigBuffer[n].e
 
-	//	{ Alive M, inc = i } overrides
-	//		- { Suspect M, inc = j }, i > j
-	//		- { Alive M, inc = j }, i > j
+	// { Alive M, inc = i } overrides
+	//   - { Suspect M, inc = j }, i > j
+	//   - { Alive M, inc = j }, i > j
 	if (e.State == Alive &&
 		((old.State == Suspect && e.Time > old.Time) ||
 			(old.State == Alive && e.Time > old.Time))) ||
 
 		// { Suspect M, inc = i } overrides
-		//		-	{ Suspect M, inc = j }, i > j
-		//		- { Alive M, inc = j }, i >= j
+		//   - { Suspect M, inc = j }, i > j
+		//   - { Alive M, inc = j }, i >= j
 		(e.State == Suspect &&
 			((old.State == Suspect && e.Time > old.Time) ||
 				(old.State == Alive && e.Time >= old.Time))) ||
 
 		// { Confirm M, inc = i } overrides
-		//		- { Alive M, inc = j }, any j
-		//		- { Suspect M, inc = j }, any j
+		//   - { Alive M, inc = j }, any j
+		//   - { Suspect M, inc = j }, any j
 		(e.State == Confirm && old.State != Confirm) {
 
 		log15.Debug("overriding", "old", old.State, "new", e.State)
