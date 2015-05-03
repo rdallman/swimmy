@@ -150,7 +150,7 @@ func New(conf *Config) (*Clique, error) {
 
 		// share a pool of buffers
 		bufPool: &sync.Pool{New: func() interface{} {
-			return make([]byte, piggySize*(1+conf.MaxBufferLen))
+			return make([]byte, maxPacketSize)
 		}},
 	}
 	heap.Init(&c.pigBuffer)
@@ -220,18 +220,12 @@ func (c *Clique) Seed(peers []*net.UDPAddr) {
 	for _, addr := range peers {
 		if addr.String() == c.me.String() {
 			continue
+		} else if len(c.pals) > 0 {
+			break // go until we get a JOINACK
 		}
-		c.outbox <- draft{What: ping, Who: addr, Origin: c.me}
-		log15.Debug("joining", "a", addr, "me", c.me)
-		// TODO the below saturates the network less on initialization
-		// at the cost of not having stable membership immediately.
-		// more experiments necessary. try propose vs. outbox?
 
-		//if i > int(float64(c.lambda)*math.Log(float64(len(peers)))) &&
-		//i >= int(float64(c.lambda)*math.Log(float64(len(c.pals)))) {
-		//log15.Crit("doneso", "i", i)
-		//break
-		//}
+		c.outbox <- draft{What: join, Who: addr, Origin: c.me}
+		log15.Debug("joining", "a", addr, "me", c.me)
 	}
 }
 
@@ -288,7 +282,8 @@ const (
 	join
 	joinAck
 
-	piggySize = net.IPv4len + 2 + 1 // sizeof(uint16) + TODO gen bits
+	piggySize     = net.IPv4len + 2 + 1 // sizeof(uint16) + TODO gen bits
+	maxPacketSize = 508                 // IPv4 minimum maximum reassembly buffer size [576] - max IP Header [60] - UDP Header [8] -- https://tools.ietf.org/html/rfc1122
 )
 
 type unread struct {
@@ -332,6 +327,8 @@ func (p *pigs) Pop() interface{} { old := *p; pe := old[len(old)-1]; *p = old[:l
 // since each is potentially a writer and a reader of 1 or more
 // and since traffic should be low, we prefer less mutexes and
 // easier to read codes.
+//
+// TODO should be easy to deadlock inbox/outbox sends if buffer fills; fix
 func (c *Clique) swim() {
 	var i uint // round robin speeds things up
 	var timeout <-chan time.Time
@@ -342,10 +339,9 @@ func (c *Clique) swim() {
 			i++
 			timeout = time.After(c.timeout)
 		case <-timeout:
-			// timeout = nil // unnecessary?
 			c.reap()
 		case in := <-c.inbox:
-			c.reply(in)
+			c.readAndReply(in)
 		case out := <-c.outbox:
 			c.send(out)
 		case prop := <-c.propose:
@@ -440,7 +436,7 @@ func (c *Clique) randPeer() *net.UDPAddr {
 }
 
 // see what kind of mail we have, and reply accordingly.
-func (c *Clique) reply(in unread) {
+func (c *Clique) readAndReply(in unread) {
 	from := in.From
 	b := in.Body
 	if len(b) < 7 || from.String() == c.me.String() {
@@ -449,11 +445,20 @@ func (c *Clique) reply(in unread) {
 	origin := parseIPPort(b[1:7])
 
 	delete(c.acks, from.String()) // if we hear from someone, they ain't gone
-	if _, ok := c.mems[from.String()]; !ok {
+
+	// for people we've never heard from, add them
+	if c.addToPals(from, 0) {
 		c.propose <- peer{Who: from, State: Alive, Time: 0}
 	}
 
-	switch b := reqT(b[0]); b {
+	switch reqT(b[0]) {
+	case join:
+		c.outbox <- draft{What: joinAck, Who: from, Origin: from}
+	case joinAck:
+		for i := 0; i+10 < len(b); {
+			c.addToPals(parseIPPort(b[i:i+6]), binary.LittleEndian.Uint32(b[i+6:i+10])) // TODO make type for time
+			i += 10
+		}
 	case ping:
 		log15.Debug("ping", "c", atomic.LoadUint32(&c.time), "me", c.me, "from", from, "wtf", origin)
 
@@ -475,6 +480,16 @@ func (c *Clique) reply(in unread) {
 		}
 	}
 	c.processPiggies(b[7:])
+}
+
+func (c *Clique) addToPals(guy *net.UDPAddr, time uint32) bool {
+	_, ok := c.mems[guy.String()]
+	if !ok {
+		c.mems[guy.String()] = &peer{Who: guy, State: Alive, Time: time}
+		c.pals = append(c.pals, guy)
+		return true
+	}
+	return false
 }
 
 func (c *Clique) processPiggies(raw []byte) {
@@ -509,23 +524,37 @@ func (c *Clique) send(out draft) {
 	binary.LittleEndian.PutUint16(buf[i:], uint16(out.Origin.Port))
 	i += 2
 
-	for j := 0; j < len(c.pigBuffer) && j < c.maxBuf; j++ {
-		p := heap.Pop(&c.pigBuffer).(pig)
+	if out.What == joinAck {
+		// send out as many of our peers as we can in one packet to get them up to speed; omit other gossip
+		for j := 0; j < maxPacketSize/(4+2+4) && j < len(c.pals); j++ { // TODO const for IP + port
+			log15.Info("yadda", "guys", maxPacketSize/(4+2), "pals", len(c.pals), "at", j)
+			p := c.pals[j]
+			i += copy(buf[i:], p.IP.To4())
+			binary.LittleEndian.PutUint16(buf[i:], uint16(p.Port))
+			i += 2
+			binary.LittleEndian.PutUint32(buf[i:], c.mems[p.String()].Time) // TODO MarshalBinary
+			i += 4
+		}
+	} else {
+		// every other type of request, gossip as many things as we're allowed
+		for j := 0; j < len(c.pigBuffer) && j < c.maxBuf; j++ {
+			p := heap.Pop(&c.pigBuffer).(pig)
 
-		i += copy(buf[i:], p.e.Who.IP.To4())
-		binary.LittleEndian.PutUint16(buf[i:], uint16(p.e.Who.Port))
-		i += 2
-		buf[i] = byte(p.e.State)
-		i++
-		binary.LittleEndian.PutUint32(buf[i:], p.e.Time)
-		i += 4
+			i += copy(buf[i:], p.e.Who.IP.To4())
+			binary.LittleEndian.PutUint16(buf[i:], uint16(p.e.Who.Port))
+			i += 2
+			buf[i] = byte(p.e.State)
+			i++
+			binary.LittleEndian.PutUint32(buf[i:], p.e.Time)
+			i += 4
 
-		p.c++ // inc our gossipped count for this event
+			p.c++ // inc our gossipped count for this event
 
-		if p.c < c.λlogn() { // piggyback this many times
-			defer heap.Push(&c.pigBuffer, p) // we need to gossip this more, but our next loop should read another value.
-		} else {
-			log15.Debug("LAMBDA", "c", p.c, "len", len(c.pigBuffer))
+			if p.c < c.λlogn() { // piggyback this many times
+				defer heap.Push(&c.pigBuffer, p) // we need to gossip this more, but our next loop should read another value.
+			} else {
+				log15.Debug("LAMBDA", "c", p.c, "len", len(c.pigBuffer))
+			}
 		}
 	}
 
@@ -535,7 +564,7 @@ func (c *Clique) send(out draft) {
 
 func (c *Clique) ponder(e peer) {
 	them, ok := c.mems[e.Who.String()]
-	log15.Debug("considering", "e", e, "mems", c.mems, "me", c.me)
+	log15.Debug("considering", "e", e, "me", c.me)
 	if ok && them.State == e.State {
 		return // if we know this, don't think much
 	}
