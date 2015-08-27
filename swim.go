@@ -50,6 +50,11 @@ const (
 	Suspect
 	Confirm
 	// note: these are dual purpose with node state
+
+	alive   = "alive"
+	suspect = "suspect"
+	confirm = "confirm"
+	invalid = "invalid"
 )
 
 type EventType byte
@@ -57,13 +62,13 @@ type EventType byte
 func (e EventType) String() string {
 	switch e {
 	case Alive:
-		return "alive"
+		return alive
 	case Suspect:
-		return "suspect"
+		return suspect
 	case Confirm:
-		return "confirm"
+		return confirm
 	}
-	return "invalid"
+	return invalid
 }
 
 // Cliques gossip about who their real friends are. like high school all over again.
@@ -88,8 +93,9 @@ type Clique struct {
 	outbox  chan draft
 	propose chan peer
 
-	read    chan bool     // returns whether read is safe; mu.RLock()
-	release chan struct{} // equivalent to mu.RUnlock()
+	// these act like locks for safe reads of peer list in user facing operations.
+	// read from  read is like mu.Lock() and send to release is like mu.Unlock()
+	read, release chan struct{}
 
 	bufPool *sync.Pool // TODO fix this
 
@@ -145,7 +151,7 @@ func New(conf *Config) (*Clique, error) {
 		propose: make(chan peer, 1024),
 
 		// simulate mutexes, for users to safely read into our state.
-		read:    make(chan bool), // sends true if stabilized, else false
+		read:    make(chan struct{}),
 		release: make(chan struct{}),
 
 		// share a pool of buffers
@@ -166,16 +172,16 @@ func New(conf *Config) (*Clique, error) {
 func (c *Clique) Me() net.Addr { return c.me }
 
 // Alive returns a copied list of peers that are currently alive.
+//
+// below lay an idea. not sure if the api is very friendly, it's confusing.
 // To attempt to wait for membership to stabilize, let safe=true
 // and we won't return until our incoming and outgoing buffers are flushed.
 func (c *Clique) Alive(safe bool) []net.Addr {
 	lst := []net.Addr{c.me}
-	for ok := range c.read {
-		if safe && !ok {
-			c.release <- struct{}{}
-			continue // wait until membership stabilizes, potentially forever ;)
-		}
-		break
+	select {
+	case <-c.read:
+	case <-c.done:
+		return nil // this is confusing, but shouldn't be doing ops anyway
 	}
 	for _, p := range c.pals {
 		if c.mems[p.String()].State == Alive {
@@ -188,22 +194,26 @@ func (c *Clique) Alive(safe bool) []net.Addr {
 
 // commit suicide
 func (c *Clique) Die() {
-	c.conn.SetReadDeadline(time.Now()) // further reads we'd say we're alive, shut up
+	c.conn.SetReadDeadline(time.Now().Add(-1 * time.Second)) // further reads we'd say we're alive, shut up
 
-	<-c.read
+	select {
+	case <-c.read:
+	case <-c.done:
+		return // means this has been called already
+	}
 	c.pigBuffer = []pig{pig{e: peer{Who: c.me, State: Confirm, Time: c.time}}}
-	times := c.λlogn()
-	for i := 0; i < times; i++ { // TODO tell everybody?
-		c.outbox <- draft{What: ping, Who: c.randPeer(), Origin: c.me} // this only works b/c buffered
+	times := c.λlogn() // this seems sufficient for other things.. TODO tell everybody?
+	drafts := make([]draft, times)
+	for i := range drafts {
+		drafts[i] = draft{What: ping, Who: c.randPeer(), Origin: c.me} // this only works b/c buffered
 	}
 	c.release <- struct{}{}
 
-	for ok := range c.read {
-		c.release <- struct{}{}
-		if ok {
-			break
-		}
+	for _, d := range drafts {
+		c.outbox <- d
 	}
+
+	log15.Debug("yo dawg")
 	close(c.done)
 	c.conn.Close()
 }
@@ -243,7 +253,7 @@ func (c *Clique) Seed(peers []*net.UDPAddr) {
 // a node may add a new event to the chain to gossip when:
 // Alive   -> Suspect:     no ack is received in gossip interval
 // Suspect -> Confirm::    no ack is received in failure interval
-// _       -> Alive:       receive from a node not in alive state
+// *       -> Alive:       receive from a node not in alive state
 //
 // in addition to new events, an event that is seen piggy backed on any received
 // messages, will be checked against the current buffer for any disparities,
@@ -346,8 +356,11 @@ func (c *Clique) swim() {
 			c.send(out)
 		case prop := <-c.propose:
 			c.ponder(prop)
-		case c.read <- len(c.inbox) == 0 && len(c.propose) == 0 && len(c.outbox) == 0:
-			<-c.release // wait, so caller can read safely
+		case c.read <- struct{}{}:
+			select {
+			case <-c.release: // wait, so caller can read safely
+			case <-c.done:
+			}
 		case <-c.done:
 			return
 		}
@@ -406,13 +419,13 @@ func (c *Clique) reap() {
 		who, _ := net.ResolveUDPAddr("udp", addr) // no err, we made it
 
 		if elapsed > c.failInterval {
-			log15.Warn("dead!", "who", addr, "me", c.me)
+			log15.Warn("dead!", "who", addr, "me", c.me, "time", c.mems[addr].Time)
 			c.propose <- peer{Who: who, State: Confirm, Time: c.mems[addr].Time}
 
 			delete(c.acks, who.String())
 
 		} else if elapsed > c.gossipInterval {
-			log15.Warn("suspect!", "who", addr, "me", c.me)
+			log15.Warn("suspect!", "who", addr, "me", c.me, "time", c.mems[addr].Time)
 			c.propose <- peer{Who: who, State: Suspect, Time: c.mems[addr].Time}
 
 		} else if elapsed > c.timeout {
@@ -453,12 +466,16 @@ func (c *Clique) readAndReply(in unread) {
 
 	switch reqT(b[0]) {
 	case join:
+		log15.Debug("join", "c", atomic.LoadUint32(&c.time), "me", c.me, "from", from, "wtf", origin)
 		c.outbox <- draft{What: joinAck, Who: from, Origin: from}
 	case joinAck:
-		for i := 0; i+10 < len(b); {
+		log15.Debug("joinAck", "c", atomic.LoadUint32(&c.time), "me", c.me, "from", from, "wtf", origin)
+		for i := 7; i+10 < len(b); {
+			log15.Info("addin to pals", "i", i, "p", parseIPPort(b[i:i+6]), "time", binary.LittleEndian.Uint32(b[i+6:i+10]))
 			c.addToPals(parseIPPort(b[i:i+6]), binary.LittleEndian.Uint32(b[i+6:i+10])) // TODO make type for time
 			i += 10
 		}
+		return
 	case ping:
 		log15.Debug("ping", "c", atomic.LoadUint32(&c.time), "me", c.me, "from", from, "wtf", origin)
 
@@ -527,7 +544,6 @@ func (c *Clique) send(out draft) {
 	if out.What == joinAck {
 		// send out as many of our peers as we can in one packet to get them up to speed; omit other gossip
 		for j := 0; j < maxPacketSize/(4+2+4) && j < len(c.pals); j++ { // TODO const for IP + port
-			log15.Info("yadda", "guys", maxPacketSize/(4+2), "pals", len(c.pals), "at", j)
 			p := c.pals[j]
 			i += copy(buf[i:], p.IP.To4())
 			binary.LittleEndian.PutUint16(buf[i:], uint16(p.Port))
@@ -580,6 +596,7 @@ func (c *Clique) ponder(e peer) {
 		log15.Warn("killing", "who", e.Who)
 		c.removePal(e.Who)
 	}
+	log15.Info("event yo", "e", e)
 	c.mems[e.Who.String()] = &e // TODO ?? we don't know this until after upsert?
 	c.upsertPiggy(e)
 	go c.tell(e)

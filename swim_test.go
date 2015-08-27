@@ -2,7 +2,6 @@ package swimmy
 
 import (
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
@@ -10,7 +9,7 @@ import (
 )
 
 func init() {
-	log15.Root().SetHandler(log15.LvlFilterHandler(log15.LvlCrit, log15.StderrHandler))
+	log15.Root().SetHandler(log15.LvlFilterHandler(log15.LvlInfo, log15.StderrHandler))
 }
 
 // TODO custom base conf
@@ -42,37 +41,16 @@ func TestBasic(t *testing.T) {
 		Port:           8500,
 		GossipInterval: 1000 * time.Millisecond,
 	}
-	cs := newN(t, 2, conf)
-	defer cleanup(cs)
-
-	// Seed() is pretty fast
-	<-time.Tick(2 * conf.GossipInterval)
-
-	for _, c := range cs {
-		if len(c.Alive(true)) < 2 {
-			t.Error("expected 2 alive, got:", c.Alive(true), "me:", c.Me())
-		}
-	}
-}
-
-func TestStableReads(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-	defer runtime.GOMAXPROCS(1)
-	conf := &Config{
-		Host:           "127.0.0.1",
-		Port:           8500,
-		GossipInterval: 200 * time.Millisecond,
-	}
-	n := 50
+	n := 3
 	cs := newN(t, n, conf)
 	defer cleanup(cs)
 
-	<-time.Tick(1 * conf.GossipInterval)
+	// Seed() is pretty fast
+	<-time.Tick(10 * conf.GossipInterval)
 
 	for _, c := range cs {
-		a := len(c.Alive(true))
-		if a != n {
-			t.Error("expected", n, "alive, got:", a)
+		if len(c.Alive(true)) < n {
+			t.Error("expected 2 alive, got:", c.Alive(true), "me:", c.Me())
 		}
 	}
 }
@@ -87,11 +65,20 @@ func TestSmallTimeout(t *testing.T) {
 	cs := newN(t, n, conf)
 	defer cleanup(cs[1:])
 
-	<-time.Tick(1 * conf.GossipInterval)
+check:
+	<-time.After(2 * conf.GossipInterval)
+
+	for _, c := range cs {
+		a := len(c.Alive(true))
+		if a != n {
+			t.Log("waiting for membership to form: expected", n, "alive, got:", a, "me", c.Me())
+			goto check
+		}
+	}
 
 	cs[0].Die()
 
-	<-time.Tick(4 * conf.GossipInterval)
+	<-time.After(30 * conf.GossipInterval)
 
 	for _, c := range cs[1:] {
 		a := len(c.Alive(true))
@@ -102,18 +89,16 @@ func TestSmallTimeout(t *testing.T) {
 }
 
 func TestFail(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-	defer runtime.GOMAXPROCS(1)
 	conf := &Config{
 		Host:           "127.0.0.1",
 		Port:           8500,
 		GossipInterval: 200 * time.Millisecond,
 	}
-	n := 100
+	n := 20
 	cs := newN(t, n, conf)
 	defer cleanup(cs[1:])
 
-	<-time.Tick(25 * conf.GossipInterval)
+	<-time.After(25 * conf.GossipInterval)
 
 	for _, c := range cs {
 		if len(c.Alive(true)) != n {
